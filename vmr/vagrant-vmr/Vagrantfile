@@ -1,0 +1,138 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+# Copywright: zoght.com
+#
+# Vagrantfile API/syntax version. Don't touch unless you know what you're doing!
+VAGRANTFILE_API_VERSION = "2" if not defined? VAGRANTFILE_API_VERSION
+
+require 'yaml'
+if File.file?('config.yml')
+  conf = YAML.load_file('config.yml')
+else
+  raise "Configuration file 'config.yml' does not exist."
+end
+
+$add_manager_to_hosts= <<SETHOSTS
+if ! grep -Fxq "#{conf['ip_address_manager']} #{conf['hostname_manager']}" /etc/hosts
+then
+    echo #{conf['ip_address_manager']} #{conf['hostname_manager']} >> /etc/hosts
+fi
+
+SETHOSTS
+
+$install_and_config=<<INIT
+sudo apt-get update
+cd shared
+./install_vmr.sh -d #{conf['vmr.docker.image']}  -l #{conf['vmr.docker.label']}
+INIT
+
+Vagrant.configure(2) do |config|
+
+
+  # provider configuration: vmware
+  config.vm.provider "vmware_fusion" do |v|
+    v.vmx["memsize"]  = conf['vm.ram'] || 1024
+  end
+
+  config.vm.box = conf['box_name'] || 'ubuntu/trusty-cloud-init'
+  config.vm.box_url = conf['box_url'] if conf['box_url']
+  config.vm.hostname = conf["host_name"] || "vagranthost"
+  config.vm.synced_folder conf["vm.shared.folder"], "/home/vagrant/shared", type: "nfs"
+
+  config.vm.provider "virtualbox" do |v|
+    v.name = conf['vm.name'] || "dev-vm"
+    v.cpus = conf['vm.cpu'] || 2
+    v.customize ["modifyvm", :id, "--memory", conf['vm.ram'] || 1024]
+    # time sync
+    v.customize [ "guestproperty", "set", :id, "/VirtualBox/GuestAdd/VBoxService/--timesync-set-threshold", 10000 ]
+  end
+
+  # NOTE(berendt): This solves the Ubuntu-specific Vagrant issue 1673.
+  #                https://github.com/mitchellh/vagrant/issues/1673
+  config.ssh.shell = "bash -c 'BASH_ENV=/etc/profile exec bash'"
+
+  # plugins
+  if Vagrant.has_plugin?("vagrant-cachier")
+    config.cache.scope = :box
+  end
+
+  # use bridge
+  if conf["use_bridge"] == false
+      # not bridged
+      if conf["ip_address"]
+        # ip address specified
+        config.vm.network :private_network, ip: conf["ip_address"]
+        config.vm.provision :shell, :inline => $add_manager_to_hosts
+      else
+        # no ip address specified, use dhcp
+        config.vm.network :private_network, type: "dhcp"
+      end
+    else
+      # we do an L2 bridge directly onto the physical network, which means
+      # that your OpenStack hosts (manager, compute) are directly in the
+      # same network as your physical host. Your OpenStack guests (2nd
+      # level guests that you create in nova) will be also on the same L2,
+      # however they will be in a different address space (10.0.0.0/24 by
+      # default).
+      #
+      # :use_dhcp_assigned_default_route true is important to let your
+      # guests actually route all the way out to the real internet.
+      config.vm.network :public_network, :bridge => conf['bridge_int'], :use_dhcp_assigned_default_route => true
+  end
+
+  # plugins
+  if Vagrant.has_plugin?("vagrant-hostmanager")
+    config.hostmanager.ignore_private_ip = false
+    config.hostmanager.include_offline = true
+    config.hostmanager.enabled = true
+    config.hostmanager.manage_host = true
+    if conf["use_bridge"] == false
+      # not bridged
+      config.hostmanager.ip_resolver = proc do |machine|
+        result = ""
+        begin
+          machine.communicate.execute("ifconfig eth1") do |type, data|
+            result << data if type == :stdout
+          end
+          # NOTE: This catches the exception when host is still
+          # not ssh reachable.
+          # https://github.com/smdahlen/vagrant-hostmanager/issues/121
+        rescue
+          result = "# NOT-UP"
+        end
+        (ip = /inet addr:(\d+\.\d+\.\d+\.\d+)/.match(result)) && ip[1]
+      end
+    end
+  end
+
+  config.vm.provision :shell, :inline => $install_and_config
+end
+
+
+# wget -qO- https://get.docker.com/ | sh
+# openssl genrsa -aes256 -out ca-key.pem -passout pass:foobar 4096
+# openssl req -new -x509 -days 365 -key ca-key.pem  -passin pass:foobar -sha256 \
+#  -subj "/C=CA/ST=Denial/L=Springfield/O=Dis/CN=www.example.com"  -out ca.pem
+# openssl genrsa -out server-key.pem 4096
+# openssl req -subj '/CN=localhost' -sha256 -new -key server-key.pem -out server.csr
+# echo subjectAltName = IP:10.10.10.20,IP:127.0.0.1 > extfile.cnf
+# openssl x509 -req -days 365 -sha256 -in server.csr -CA ca.pem -CAkey ca-key.pem \
+#   -passin pass:foobar -CAcreateserial -out server-cert.pem -extfile extfile.cnf
+# openssl genrsa -out key.pem 4096
+# openssl req -subj '/CN=client' -new -key key.pem -out client.csr
+# echo extendedKeyUsage = clientAuth > extfile.cnf
+# openssl x509 -req -days 365 -sha256 -in client.csr -CA ca.pem -CAkey ca-key.pem \
+#   -passin pass:foobar -CAcreateserial -out cert.pem -extfile extfile.cnf
+# rm -v client.csr server.csr
+# sudo service docker stop
+# sudo docker -d --tlsverify --tlscacert=ca.pem --tlscert=server-cert.pem --tlskey=server-key.pem   -H=0.0.0.0:2376&
+# mkdir -pv /home/vagrant/.docker
+# cp -v {ca,cert,key}.pem /home/vagrant/.docker
+# cp -v server-*.pem /home/vagrant/.docker
+# export DOCKER_HOST=tcp://localhost:2376 DOCKER_TLS_VERIFY=1
+# echo "export DOCKER_HOST=tcp://localhost:2376 DOCKER_TLS_VERIFY=1" > docker_source_me.sh
+# echo "export DOCKER_TLS_VERIFY=1" >> docker_source_me.sh
+# echo "source docker_source_me.sh" > docker_start.sh
+# echo "sudo docker daemon --tlsverify --tlscacert=/home/vagrant/.docker/ca.pem --tlscert=/home/vagrant/.docker/server-cert.pem --tlskey=/home/vagrant/.docker/server-key.pem   -H=0.0.0.0:2376&" >> docker_start.sh
+# chmod +x docker_start.sh
+# rm -f *.pem *.cnf *.csr *.srl
